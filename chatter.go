@@ -35,8 +35,6 @@
 
 package chatterbox
 
-import "fmt"
-
 import (
 	//	"bytes" //un-comment for helpers like bytes.equal
 	"encoding/binary"
@@ -135,10 +133,24 @@ func (c *Chatter) EndSession(partnerIdentity *PublicKey) error {
 	if _, exists := c.Sessions[*partnerIdentity]; !exists {
 		return errors.New("Don't have that session open to tear down")
 	}
+	//TODO
+	sess := c.Sessions[*partnerIdentity]
+	sess.MyDHRatchet.Zeroize()
+	sess.RootChain.Zeroize()
+	if sess.SendChain != nil {
+		sess.SendChain.Zeroize()
+	}
+	sess.ReceiveChain.Zeroize()
+	for i := 1; i < sess.ReceiveCounter+1; i++ {
+		if sess.CachedReceiveKeys[i] != nil {
+			sess.CachedReceiveKeys[i].Zeroize()
+		}
+	}
+	sess.SendCounter = 0
+	sess.ReceiveCounter = 0
+	sess.LastUpdate = 0
 
 	delete(c.Sessions, *partnerIdentity)
-
-	// TODO: your code here to zeroize remaining state
 
 	return nil
 }
@@ -162,8 +174,6 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 
 	// TODO: your code here
 	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, nil
-
-	return nil, errors.New("Not implemented")
 }
 
 // ReturnHandshake prepares the second message sent in a handshake, containing
@@ -200,8 +210,6 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 
 	checkkey := kroot.DeriveKey(HANDSHAKE_CHECK_LABEL)
 	return &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey, checkkey, nil
-
-	return nil, nil, errors.New("Not implemented")
 }
 
 // FinalizeHandshake lets the initiator receive the responder's ephemeral key
@@ -229,8 +237,6 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity,
 
 	checkkey := kroot.DeriveKey(HANDSHAKE_CHECK_LABEL)
 	return checkkey, nil
-
-	return nil, errors.New("Not implemented")
 }
 
 // SendMessage is used to send the given plaintext string as a message.
@@ -243,27 +249,22 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
 	}
 
 	sess := c.Sessions[*partnerIdentity]
-	//fmt.Println()
 	if sess.SendChain == nil {
-		//fmt.Print("inside", sess.RootChain)
 		//temps
 		tMyDHRatchet := GenerateKeyPair()
 		tRootChain := CombineKeys(sess.RootChain.DeriveKey(ROOT_LABEL), DHCombine(sess.PartnerDHRatchet, &tMyDHRatchet.PrivateKey))
 
 		sess.MyDHRatchet.Zeroize()
 		sess.RootChain.Zeroize()
-		//fmt.Println("after zero, trc", tRootChain, "rc", sess.RootChain)
 
 		sess.MyDHRatchet = tMyDHRatchet
 		sess.RootChain = tRootChain
 		sess.SendChain = sess.RootChain.Duplicate()
 		sess.LastUpdate = sess.SendCounter + 1
-		//fmt.Println("after assignment, trc", tRootChain, "rc", sess.RootChain)
 	}
 	tSendChain := sess.SendChain.DeriveKey(CHAIN_LABEL)
 	sess.SendChain.Zeroize()
 	sess.SendChain = tSendChain
-	//fmt.Println("sendcounter", sess.SendCounter, plaintext)
 	sess.SendCounter = sess.SendCounter + 1
 
 	iv := NewIV()
@@ -277,20 +278,12 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
 		LastUpdate:    sess.LastUpdate,
 		IV:            iv,
 	}
-	//fmt.Println("mcreated")
 	// TODO: your code here
-	message.Ciphertext = sess.SendChain.DeriveKey(KEY_LABEL).AuthenticatedEncrypt(plaintext, message.EncodeAdditionalData(), iv)
+	messagekey := sess.SendChain.DeriveKey(KEY_LABEL)
+	message.Ciphertext = messagekey.AuthenticatedEncrypt(plaintext, message.EncodeAdditionalData(), iv)
+	messagekey.Zeroize()
 
-	//kroot
-	//first hash chain value is derived from root key
-	//update ur
-	//if ur bob and alice sent a pubkey with different. update alice's ephemeral, update own keypair, update own
-	//fmt.Println("sc", sess.SendChain, "done")
-	//fmt.Println("rootc", sess.RootChain, "RC")
-	//fmt.Println("senderkey", sess.MyDHRatchet.PublicKey)
-	//fmt.Println(message)
 	return message, nil
-	return message, errors.New("Not implemented")
 }
 
 // ReceiveMessage is used to receive the given message and return the correct
@@ -305,79 +298,61 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	// TODO: your code here
 	sess := c.Sessions[*message.Sender]
 
-	//update DH ratchet keys
-	//fmt.Println()
-	//fmt.Println("abto root", sess.RootChain, "rec", sess.ReceiveChain)
-
-	//temps
-	tPartnerDHRatchet := sess.PartnerDHRatchet.Duplicate()
+	//temps, for restore values
+	tPartnerDHRatchet := sess.PartnerDHRatchet
 	tRootChain := sess.RootChain.Duplicate()
 	tReceiveChain := sess.ReceiveChain.Duplicate()
 	tReceiveCounter := sess.ReceiveCounter
-	clearsc:=false
-	//fmt.Println("temprcount", tReceiveCounter)
+	clearsc := false
 
+	//message keys derived from old root
 	if sess.ReceiveCounter+1 < message.LastUpdate {
-		fmt.Print("preroot", message.Counter, sess.ReceiveCounter)
 		for i := sess.ReceiveCounter + 1; i < message.LastUpdate; i++ {
-			//fmt.Println("RC", i, sess.ReceiveChain)
 			newrecchain := sess.ReceiveChain.DeriveKey(CHAIN_LABEL)
 			sess.ReceiveChain.Zeroize()
 			sess.ReceiveChain = newrecchain
-			sess.CachedReceiveKeys[i] = sess.ReceiveChain.Duplicate()
+			sess.CachedReceiveKeys[i] = sess.ReceiveChain.DeriveKey(KEY_LABEL)
 		}
 		sess.ReceiveCounter = message.LastUpdate - 1
-		//fmt.Print(sess.CachedReceiveKeys)
 	}
 
-	if message.NextDHRatchet != nil && (((*message.NextDHRatchet).X).Cmp((*sess.PartnerDHRatchet).X)!=0 || ((*message.NextDHRatchet).Y).Cmp((*sess.PartnerDHRatchet).Y)!=0) && sess.ReceiveCounter <= message.LastUpdate {
-		//fmt.Print("changing", message.NextDHRatchet)
+	//checking if partner ratcheted
+	if message.NextDHRatchet != nil && *message.NextDHRatchet != *sess.PartnerDHRatchet && sess.ReceiveCounter <= message.LastUpdate {
 		sess.PartnerDHRatchet = message.NextDHRatchet
 
 		newrootchain := CombineKeys(sess.RootChain.DeriveKey(ROOT_LABEL), DHCombine(sess.PartnerDHRatchet, &sess.MyDHRatchet.PrivateKey))
 		sess.RootChain.Zeroize()
-		sess.RootChain=newrootchain
+		sess.RootChain = newrootchain
 
 		sess.ReceiveChain.Zeroize()
 		sess.ReceiveChain = sess.RootChain.Duplicate()
-		//fmt.Println("new rc", sess.RootChain)
 
-		clearsc=true
+		//signals to set sendchain to null if decryption succeeds
+		clearsc = true
 	}
 
-	//check for out-of-order messages
+	//getting message keys with new root
 	if message.Counter >= sess.ReceiveCounter+1 {
 		//fmt.Print("entered", message.Counter, sess.ReceiveCounter)
 		for i := sess.ReceiveCounter + 1; i <= message.Counter; i++ {
-			
+
 			newrecchain := sess.ReceiveChain.DeriveKey(CHAIN_LABEL)
 			sess.ReceiveChain.Zeroize()
-			sess.ReceiveChain=newrecchain
+			sess.ReceiveChain = newrecchain
 
-			//fmt.Println("RC", i, sess.ReceiveChain)
-
-			sess.CachedReceiveKeys[i] = sess.ReceiveChain.Duplicate()
+			sess.CachedReceiveKeys[i] = sess.ReceiveChain.DeriveKey(KEY_LABEL)
 		}
 		sess.ReceiveCounter = message.Counter
-		//fmt.Print(sess.CachedReceiveKeys)
 	}
 
 	//retrieve correct key for encryption
-	//deckey := sess.CachedReceiveKeys[message.Counter]
 	deckey := sess.CachedReceiveKeys[message.Counter]
-	//fmt.Println(message)
-	//fmt.Println("deckey", deckey)
-	// temps
-	// tPartnerDHRatchet:=sess.PartnerDHRatchet.Duplicate()
-	// tRootChain:=sess.RootChain.Duplicate()
-	// tSendChain:=sess.SendChain.Duplicate()
-	// tReceiveChain:=sess.ReceiveChain.Duplicate()
-	// tReceiveCounter :=sess.ReceiveCounter
 
 	//decrypt message
-	plaintext, err := deckey.DeriveKey(KEY_LABEL).AuthenticatedDecrypt(message.Ciphertext, message.EncodeAdditionalData(), message.IV)
+	plaintext, err := deckey.AuthenticatedDecrypt(message.Ciphertext, message.EncodeAdditionalData(), message.IV)
 	if err != nil {
-		fmt.Print("errrrrerer")
+		//delete all changes and restore to initial values
+		//fmt.Print("errrrrror")
 		sess.RootChain.Zeroize()
 		sess.ReceiveChain.Zeroize()
 
@@ -388,23 +363,23 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 		for i := sess.ReceiveCounter + 1; i <= message.Counter; i++ {
 			sess.CachedReceiveKeys[i].Zeroize()
 		}
-		//fmt.Println("rec", sess.ReceiveChain)
-		//fmt.Println("root", sess.RootChain)
-		//fmt.Println(sess.ReceiveCounter)
 		return "", err
 	}
-	fmt.Println("gethere", plaintext)
+	//fmt.Println("gethere", plaintext)
 
-	//delete key and counter
+	//zeroize used message key
 	sess.CachedReceiveKeys[message.Counter].Zeroize()
-	//sess.CachedReceiveKeys[message.Counter]=nil
-	if(clearsc){
+
+	//set sendchain to null
+	if clearsc {
 		if sess.SendChain != nil {
 			sess.SendChain.Zeroize()
 			sess.SendChain = nil
 		}
 	}
 
+	tRootChain.Zeroize()
+	tReceiveChain.Zeroize()
+
 	return plaintext, nil
-	return "", errors.New("Not implemented")
 }
